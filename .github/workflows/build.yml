@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
 分支:
-      - "master"
+      - "main"
     paths:
       - "Makefile"
       - "luci-app-socat/**"

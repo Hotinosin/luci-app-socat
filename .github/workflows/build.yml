@@ -1,75 +1,130 @@
-name: build
-on:
-  workflow_dispatch:
+name: "Build luci-app-socat (IPK & APK)"
 
-permissions:
-  contents: write
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  push:
+分支:
+      - "master"
+    paths:
+      - "Makefile"
+      - "luci-app-socat/**"
+
+env:
+  TZ: Asia/Shanghai
+  PACKAGE_NAME: luci-app-socat
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-    env:
-      PACKAGE_NAME: luci-app-socat
-      PACKAGE_I18N_NAME: luci-i18n-socat-zh-cn
-      # 更新后的 SDK URL
-      SDK_URL: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  job_check:
+    name: Check Version
+    runs-on: ubuntu-latest
+    outputs:
+      latest_version: ${{ steps.check_version.outputs.latest_version }}
     steps:
-      - name: 优化编译依赖安装 (增加 zstd 支持)
-        run: |
-          sudo -E apt update
-          # 必须包含 zstd 以解压最新的 SDK 格式
-          sudo -E apt install -y build-essential clang flex gawk gettext \
-            git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-            file wget swig tar zstd
-          
-          sudo -E apt autoremove --purge -y
-          sudo -E apt clean
-          sudo timedatectl set-timezone "Asia/Shanghai"
-
-      - name: 下载并解压 SDK (GCC 14.3.0 ZST)
-        run: |
-          wget -qO openwrt.tar.zst "${{ env.SDK_URL }}"
-          mkdir openwrt
-          # 使用 --strip-components=1 直接解压内容到 openwrt 文件夹，忽略外层长目录名
-          tar -I zstd -xvf openwrt.tar.zst -C openwrt --strip-components=1
-          echo "OPENWRT_ROOT_PATH=$GITHUB_WORKSPACE/openwrt" >> $GITHUB_ENV
-
-      - name: 检出源码
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone
 
-      - name: 整理目录与 Feeds
-        working-directory: ${{ env.OPENWRT_ROOT_PATH }}
+      - name: Generate Version Tag
+        id: check_version
         run: |
-          cp -RT ./package/${{ env.PACKAGE_NAME }}-clone/${{ env.PACKAGE_NAME }} ./package/${{ env.PACKAGE_NAME }}
-          rm -rf ./package/${{ env.PACKAGE_NAME }}-clone
+          latest_version="v$(date +%Y%m%d%H%M)"
+          echo "latest_version=${latest_version}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Build for OpenWrt Official SDK
+          tag_name: ${{ steps.check_version.outputs.latest_version }}
+
+  # --- 编译 IPK (基于 24.10) ---
+  build_ipk:
+    name: Build IPK (v24.10)
+    needs: job_check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Packages
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install zstd build-essential clang flex bison g++ gawk gettext git libncurses5-dev libssl-dev python3-venv rsync unzip zlib1g-dev file wget
+          sudo -E apt-get -qq clean
+
+      - name: Cache SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          key: sdk-ipk-24.10-x86-64
+
+      - name: Init SDK Environment
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          url_sdk="https://archive.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          wget -qO- $url_sdk | tar --zstd -xvf - -C ./
+          mv openwrt-sdk-* sdk
+          cd sdk
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 配置与编译 (支持 IPK & APK)
-        working-directory: ${{ env.OPENWRT_ROOT_PATH }}
+      - name: Compile Package
         run: |
+          cd sdk
+          # 链接当前仓库代码到 SDK package 目录
+          ln -s $GITHUB_WORKSPACE/${{ env.PACKAGE_NAME }} package/${{ env.PACKAGE_NAME }}
+          ./scripts/feeds install -a
           echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" > .config
-          echo "CONFIG_TARGET_x86=y" >> .config
-          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           make defconfig
-          # 编译指定的包
-          make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc) V=s
-
-      - name: 归档成果 (同时收集 .ipk 和 .apk)
-        working-directory: ${{ env.OPENWRT_ROOT_PATH }}
-        run: |
-          mkdir -p ./artifact
-          # 遍历 bin 目录，寻找所有生成的 ipk 和 apk 文件并扁平化存放
-          find ./bin/ -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} ./artifact/ \;
-          if [ -z "$(ls -A ./artifact)" ]; then
-            echo "错误：未发现编译生成的安装包！"
-            exit 1
-          fi
-
-      - name: 上传 Build Artifacts
-        uses: actions/upload-artifact@v4
+          make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc)
+          
+      - name: Upload IPK to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ env.PACKAGE_NAME }}-snapshot-output
-          path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/
+          tag_name: ${{ needs.job_check.outputs.latest_version }}
+          files: sdk/bin/packages/x86_64/base/${{ env.PACKAGE_NAME }}*
+
+  # --- 编译 APK (基于 25.12 Snapshot) ---
+  build_apk:
+    name: Build APK (v25.12 Snapshot)
+    needs: job_check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Packages
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install zstd build-essential clang flex bison g++ gawk gettext git libncurses5-dev libssl-dev python3-venv rsync unzip zlib1g-dev file wget
+          sudo -E apt-get -qq clean
+
+      - name: Cache SDK (APK)
+        id: cache-sdk-apk
+        uses: actions/cache@v4
+        with:
+          path: sdk_apk
+          key: sdk-apk-snapshot-x86-64
+
+      - name: Init SDK Environment (APK)
+        if: steps.cache-sdk-apk.outputs.cache-hit != 'true'
+        run: |
+          url_sdk="https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+          wget -qO- $url_sdk | tar --zstd -xvf - -C ./
+          mv openwrt-sdk-* sdk_apk
+          cd sdk_apk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Compile Package
+        run: |
+          cd sdk_apk
+          ln -s $GITHUB_WORKSPACE/${{ env.PACKAGE_NAME }} package/${{ env.PACKAGE_NAME }}
+          ./scripts/feeds install -a
+          echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" > .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          make defconfig
+          make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc)
+
+      - name: Upload APK to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.job_check.outputs.latest_version }}
+          files: sdk_apk/bin/packages/x86_64/base/${{ env.PACKAGE_NAME }}*.apk

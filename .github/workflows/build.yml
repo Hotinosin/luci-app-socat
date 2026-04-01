@@ -1,15 +1,17 @@
 name: build
 on:
-    workflow_dispatch:
+  workflow_dispatch:
+
 permissions:
   contents: write
   discussions: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-        PACKAGE_NAME: luci-app-socat
-        PACKAGE_I18N_NAME: luci-i18n-socat-zh-cn
+      PACKAGE_NAME: luci-app-socat
+      PACKAGE_I18N_NAME: luci-i18n-socat-zh-cn
     steps:
       - name: 安装编译依赖
         run: |
@@ -22,16 +24,16 @@ jobs:
           sudo -E apt clean
           sudo timedatectl set-timezone "Asia/Shanghai"
 
-      - name: 下载SDK
+      - name: 下载 SDK (25.12 / Snapshot)
         run: |
-          url=https://downloads.openwrt.org/releases/23.05.2/targets/x86/64/openwrt-sdk-23.05.2-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          # 使用 OpenWrt Snapshots 最新 SDK
+          url=https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.xz
           wget -O openwrt.tar.xz $url
           tar xvf openwrt.tar.xz
-          mv $(basename $url | awk -F '.tar.xz' '{ print $1 }') openwrt
+          mv openwrt-sdk-* openwrt
           cd openwrt
           export OPENWRT_ROOT_PATH="$(pwd)"
           echo "OPENWRT_ROOT_PATH=$OPENWRT_ROOT_PATH" >> $GITHUB_ENV
-          cd $GITHUB_WORKSPACE && cat $GITHUB_ENV >> prepare_ENV
 
       - name: 将存储库签出到运行器
         uses: actions/checkout@v4
@@ -40,8 +42,8 @@ jobs:
 
       - name: 移动源代码
         run: |
-            cp -RT ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone/${{ env.PACKAGE_NAME }} ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}
-            rm -rf ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone
+          cp -RT ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone/${{ env.PACKAGE_NAME }} ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}
+          rm -rf ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone
 
       - name: 更新 feeds 
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
@@ -53,26 +55,31 @@ jobs:
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" > .config
-          echo "CONFIG_TARGET_x86=y" >> $OPENWRT_ROOT_PATH/.config
-          echo "CONFIG_TARGET_x86_64=y" >> $OPENWRT_ROOT_PATH/.config
-          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> $OPENWRT_ROOT_PATH/.config
-          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> $OPENWRT_ROOT_PATH/.config
+          echo "CONFIG_TARGET_x86=y" >> .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          # 25.12 必须确保启用 APK 支持（通常默认开启）
           make defconfig
-          ./scripts/diffconfig.sh
 
       - name: 编译
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc) || make package/${{ env.PACKAGE_NAME }}/compile -j1 V=sc
 
-      - name: 准备 artifact
+      - name: 准备 artifact (同时提取 IPK 和 APK)
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           mkdir -p ./artifact
-          cp -rf $(find ./bin/packages/ -type f -name "${{ env.PACKAGE_NAME }}*.ipk" -o -name "${{ env.PACKAGE_I18N_NAME }}*.ipk") ./artifact || cp -rf $(find ./bin/targets/ -type f -name "*.ipk") ./artifact || cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact || exit 0
+          # 查找并复制所有的 .ipk 和 .apk 文件
+          find ./bin/ -type f \( -name "*.ipk" -o -name "*.apk" \) | while read file; do
+            cp "$file" ./artifact/
+          done
+          # 如果没有找到任何文件则退出
+          [ "$(ls -A ./artifact)" ] || exit 1
 
-      - name: 上传build artifacts
+      - name: 上传 build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PACKAGE_NAME }}
+          name: ${{ env.PACKAGE_NAME }}-25.12-output
           path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/*

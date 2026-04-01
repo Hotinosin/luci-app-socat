@@ -4,7 +4,6 @@ on:
 
 permissions:
   contents: write
-  discussions: write
 
 jobs:
   build:
@@ -12,74 +11,65 @@ jobs:
     env:
       PACKAGE_NAME: luci-app-socat
       PACKAGE_I18N_NAME: luci-i18n-socat-zh-cn
+      # 更新后的 SDK URL
+      SDK_URL: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
     steps:
-      - name: 安装编译依赖
+      - name: 优化编译依赖安装 (增加 zstd 支持)
         run: |
-          sudo -E apt-mark hold grub-efi-amd64-signed
           sudo -E apt update
-          sudo -E apt -y full-upgrade
-          sudo apt install -y ack antlr3 aria2 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pip libpython3-dev qemu-utils clang g++ python3-distutils rsync unzip zlib1g-dev wget
-          sudo -E systemctl daemon-reload 
-          sudo -E apt -y autoremove --purge
+          # 必须包含 zstd 以解压最新的 SDK 格式
+          sudo -E apt install -y build-essential clang flex gawk gettext \
+            git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
+            file wget swig tar zstd
+          
+          sudo -E apt autoremove --purge -y
           sudo -E apt clean
           sudo timedatectl set-timezone "Asia/Shanghai"
 
-      - name: 下载 SDK (25.12 / Snapshot)
+      - name: 下载并解压 SDK (GCC 14.3.0 ZST)
         run: |
-          # 使用 OpenWrt Snapshots 最新 SDK
-          url=https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.xz
-          wget -O openwrt.tar.xz $url
-          tar xvf openwrt.tar.xz
-          mv openwrt-sdk-* openwrt
-          cd openwrt
-          export OPENWRT_ROOT_PATH="$(pwd)"
-          echo "OPENWRT_ROOT_PATH=$OPENWRT_ROOT_PATH" >> $GITHUB_ENV
+          wget -qO openwrt.tar.zst "${{ env.SDK_URL }}"
+          mkdir openwrt
+          # 使用 --strip-components=1 直接解压内容到 openwrt 文件夹，忽略外层长目录名
+          tar -I zstd -xvf openwrt.tar.zst -C openwrt --strip-components=1
+          echo "OPENWRT_ROOT_PATH=$GITHUB_WORKSPACE/openwrt" >> $GITHUB_ENV
 
-      - name: 将存储库签出到运行器
+      - name: 检出源码
         uses: actions/checkout@v4
         with:
           path: ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone
 
-      - name: 移动源代码
-        run: |
-          cp -RT ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone/${{ env.PACKAGE_NAME }} ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}
-          rm -rf ${{ env.OPENWRT_ROOT_PATH }}/package/${{ env.PACKAGE_NAME }}-clone
-
-      - name: 更新 feeds 
+      - name: 整理目录与 Feeds
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
+          cp -RT ./package/${{ env.PACKAGE_NAME }}-clone/${{ env.PACKAGE_NAME }} ./package/${{ env.PACKAGE_NAME }}
+          rm -rf ./package/${{ env.PACKAGE_NAME }}-clone
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 加载自定义配置并生成配置文件
+      - name: 配置与编译 (支持 IPK & APK)
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" > .config
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
-          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
-          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
-          # 25.12 必须确保启用 APK 支持（通常默认开启）
           make defconfig
+          # 编译指定的包
+          make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc) V=s
 
-      - name: 编译
-        working-directory: ${{ env.OPENWRT_ROOT_PATH }}
-        run: |
-          make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc) || make package/${{ env.PACKAGE_NAME }}/compile -j1 V=sc
-
-      - name: 准备 artifact (同时提取 IPK 和 APK)
+      - name: 归档成果 (同时收集 .ipk 和 .apk)
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           mkdir -p ./artifact
-          # 查找并复制所有的 .ipk 和 .apk 文件
-          find ./bin/ -type f \( -name "*.ipk" -o -name "*.apk" \) | while read file; do
-            cp "$file" ./artifact/
-          done
-          # 如果没有找到任何文件则退出
-          [ "$(ls -A ./artifact)" ] || exit 1
+          # 遍历 bin 目录，寻找所有生成的 ipk 和 apk 文件并扁平化存放
+          find ./bin/ -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} ./artifact/ \;
+          if [ -z "$(ls -A ./artifact)" ]; then
+            echo "错误：未发现编译生成的安装包！"
+            exit 1
+          fi
 
-      - name: 上传 build artifacts
+      - name: 上传 Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PACKAGE_NAME }}-25.12-output
-          path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/*
+          name: ${{ env.PACKAGE_NAME }}-snapshot-output
+          path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/

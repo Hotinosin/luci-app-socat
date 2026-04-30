@@ -1,10 +1,6 @@
 name: build
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag'
-        required: true
 
 permissions:
   contents: write
@@ -61,14 +57,14 @@ jobs:
           # 编译指定的包
           make package/${{ env.PACKAGE_NAME }}/compile -j$(nproc) V=s
 
-      - name: 归档成果 (只收集 socat 相关的 .apk)
+      - name: 归档成果 (同时收集 .ipk 和 .apk)
         working-directory: ${{ env.OPENWRT_ROOT_PATH }}
         run: |
           mkdir -p ./artifact
-          # 遍历 bin 目录，寻找 socat 相关的 apk 文件
-          find ./bin/ -type f -name "*socat*.apk" -exec cp {} ./artifact/ \;
+          # 遍历 bin 目录，寻找所有生成的 ipk 和 apk 文件并扁平化存放
+          find ./bin/ -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} ./artifact/ \;
           if [ -z "$(ls -A ./artifact)" ]; then
-            echo "错误：未发现编译生成的 socat 相关 apk 包！"
+            echo "错误：未发现编译生成的安装包！"
             exit 1
           fi
 
@@ -77,7 +73,3 @@ jobs:
         with:
           name: ${{ env.PACKAGE_NAME }}-snapshot-output
           path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/
-
-      - name: 创建 Release 并上传 apk
-        run: |
-          gh release create ${{ inputs.tag }} ${{ env.OPENWRT_ROOT_PATH }}/artifact/*.apk --title "Release ${{ inputs.tag }}" --notes "Automated release of socat apk packages"

@@ -79,5 +79,9 @@ jobs:
           path: ${{ env.OPENWRT_ROOT_PATH }}/artifact/
 
       - name: 创建 Release 并上传 apk
-        run: |
-          gh release create ${{ inputs.tag }} ${{ env.OPENWRT_ROOT_PATH }}/artifact/*.apk --title "Release ${{ inputs.tag }}" --notes "Automated release of socat apk packages"
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Release ${{ inputs.tag }}
+          body: Automated release of socat apk packages
+          files: ${{ env.OPENWRT_ROOT_PATH }}/artifact/*.apk
